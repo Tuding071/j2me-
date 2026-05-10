@@ -27,6 +27,7 @@ jobs:
           mkdir -p $PKG/ui
           mkdir -p app/src/main/res/values
           mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/layout
           mkdir -p gradle/wrapper
 
           cp EmulatorApp.kt $PKG/
@@ -50,7 +51,7 @@ jobs:
           }
           EOF
 
-          cat > app/build.gradle.kts << EOF
+          cat > app/build.gradle.kts << 'EOF'
           plugins {
               id("com.android.application")
               id("org.jetbrains.kotlin.android")
@@ -64,11 +65,11 @@ jobs:
                   applicationId = "com.j2me.emulator"
                   minSdk        = 26
                   targetSdk     = 36
-                  versionCode   = ${BUILD_NUMBER}
-                  versionName   = "1.0.${BUILD_NUMBER}"
+                  versionCode   = 1
+                  versionName   = "1.0"
                   
                   ndk {
-                      abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+                      abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
                   }
               }
 
@@ -94,7 +95,12 @@ jobs:
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
               }
-              kotlinOptions { jvmTarget = "17" }
+              
+              kotlin {
+                  compilerOptions {
+                      jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+                  }
+              }
               
               externalNativeBuild {
                   cmake {
@@ -232,8 +238,16 @@ jobs:
                   sscanf(maps_line, "%lx-%lx %s", &start, &end, perms);
                   
                   if (strstr(perms, "rw")) {
-                      std::vector<uint64_t> matches = scanMemoryRange(start, end, value, typeSize);
-                      addresses.insert(addresses.end(), matches.begin(), matches.end());
+                      for (uintptr_t addr = start; addr < end - typeSize; addr += typeSize) {
+                          uint64_t data = 0;
+                          struct iovec local_iov = { &data, (size_t)typeSize };
+                          struct iovec remote_iov = { (void*)addr, (size_t)typeSize };
+                          ssize_t bytes = process_vm_readv(getpid(), &local_iov, 1, &remote_iov, 1, 0);
+                          
+                          if (bytes == typeSize && data == value) {
+                              addresses.push_back(addr);
+                          }
+                      }
                   }
               }
               fclose(maps);
@@ -241,24 +255,6 @@ jobs:
               jlongArray result = env->NewLongArray(addresses.size());
               env->SetLongArrayRegion(result, 0, addresses.size(), (jlong*)addresses.data());
               return result;
-          }
-
-          std::vector<uint64_t> scanMemoryRange(uintptr_t start, uintptr_t end, uint64_t value, int size) {
-              std::vector<uint64_t> results;
-              uintptr_t current = start;
-              
-              while (current < end - size) {
-                  uint64_t data = 0;
-                  struct iovec local_iov = { (void*)current, (size_t)size };
-                  struct iovec remote_iov = { &data, (size_t)size };
-                  ssize_t bytes = process_vm_readv(getpid(), &local_iov, 1, &remote_iov, 1, 0);
-                  
-                  if (bytes == size && data == value) {
-                      results.push_back(current);
-                  }
-                  current += size;
-              }
-              return results;
           }
           CPPEOF
 
@@ -277,6 +273,330 @@ jobs:
               struct iovec local_iov = { &value, (size_t)size };
               struct iovec remote_iov = { (void*)address, (size_t)size };
               
+              ssize_t bytes = process_vm_writev(getpid(), &local_iov, 1, &remote_iov, 1, 0);
+              
+              return (bytes == size) ? JNI_TRUE : JNI_FALSE;
+          }
+
+          extern "C" JNIEXPORT jlong JNICALL
+          Java_com_j2me_emulator_hacker_MemoryEditor_nativeReadMemory(
+              JNIEnv* env, jobject /* this */, jlong address, jint size) {
+              
+              jlong value = 0;
+              struct iovec local_iov = { &value, (size_t)size };
+              struct iovec remote_iov = { (void*)address, (size_t)size };
+              
+              process_vm_readv(getpid(), &local_iov, 1, &remote_iov, 1, 0);
+              return value;
+          }
+          CPPEOF
+
+          cat > app/src/main/cpp/jni_bridge.cpp << 'CPPEOF'
+          #include <jni.h>
+
+          JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+              return JNI_VERSION_1_6;
+          }
+          CPPEOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+              
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:theme="@style/AppTheme"
+                  android:hardwareAccelerated="true"
+                  android:largeHeap="true"
+                  android:usesCleartextTraffic="true">
+                  
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <resources>
+              <string name="app_name">J2ME Game Hacker</string>
+              <string name="load_game">Load Game</string>
+              <string name="start_game">Start</string>
+              <string name="pause_game">Pause</string>
+              <string name="open_hacker">Game Hacker</string>
+              <string name="search_value">Search Value</string>
+              <string name="edit_value">Edit Value</string>
+              <string name="memory_regions">Memory Regions</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/themes.xml << 'EOF'
+          <resources>
+              <style name="AppTheme" parent="Theme.MaterialComponents.Dark.NoActionBar">
+                  <item name="colorPrimary">#1a1a2e</item>
+                  <item name="colorPrimaryVariant">#16213e</item>
+                  <item name="colorOnPrimary">#ffffff</item>
+                  <item name="colorSecondary">#e94560</item>
+                  <item name="colorSecondaryVariant">#c23152</item>
+                  <item name="android:windowBackground">#0a0a1a</item>
+                  <item name="android:statusBarColor">#0a0a1a</item>
+                  <item name="android:navigationBarColor">#0a0a1a</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/arrays.xml << 'EOF'
+          <resources>
+              <string-array name="search_types">
+                  <item>Integer (4 bytes)</item>
+                  <item>Long (8 bytes)</item>
+                  <item>Float (4 bytes)</item>
+                  <item>Double (8 bytes)</item>
+              </string-array>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/layout/activity_main.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:background="#0a0a1a">
+              
+              <!-- Game View -->
+              <FrameLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1">
+                  
+                  <com.j2me.emulator.ui.GameView
+                      android:id="@+id/gameView"
+                      android:layout_width="match_parent"
+                      android:layout_height="match_parent" />
+                  
+                  <!-- Controls Overlay -->
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_gravity="bottom"
+                      android:orientation="horizontal"
+                      android:padding="8dp">
+                      
+                      <Button
+                          android:id="@+id/loadGameButton"
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:text="Load Game"
+                          android:textSize="14sp" />
+                      
+                      <Button
+                          android:id="@+id/toggleHackerButton"
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:text="Hacker"
+                          android:textSize="14sp"
+                          android:backgroundTint="#e94560" />
+                  </LinearLayout>
+              </FrameLayout>
+              
+              <!-- Hacker Panel -->
+              <LinearLayout
+                  android:id="@+id/hackerPanel"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="12dp"
+                  android:background="#1a1a2e"
+                  android:visibility="gone">
+                  
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="GAME HACKER"
+                      android:textColor="#e94560"
+                      android:textSize="18sp"
+                      android:textStyle="bold"
+                      android:gravity="center"
+                      android:paddingBottom="8dp" />
+                  
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:orientation="horizontal"
+                      android:layout_marginBottom="8dp">
+                      
+                      <EditText
+                          android:id="@+id/searchEditText"
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:hint="Enter value..."
+                          android:textColor="#ffffff"
+                          android:textColorHint="#888888"
+                          android:inputType="numberDecimal" />
+                      
+                      <Spinner
+                          android:id="@+id/searchTypeSpinner"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginStart="8dp" />
+                  </LinearLayout>
+                  
+                  <Button
+                      android:id="@+id/searchButton"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="SEARCH"
+                      android:backgroundTint="#e94560" />
+                  
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:orientation="horizontal"
+                      android:layout_marginTop="8dp">
+                      
+                      <Button
+                          android:id="@+id/increasedButton"
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:text="Increased"
+                          android:textSize="12sp" />
+                      
+                      <Button
+                          android:id="@+id/decreasedButton"
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:text="Decreased"
+                          android:textSize="12sp" />
+                      
+                      <Button
+                          android:id="@+id/clearButton"
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:text="Clear"
+                          android:textSize="12sp" />
+                  </LinearLayout>
+                  
+                  <ListView
+                      android:id="@+id/resultsListView"
+                      android:layout_width="match_parent"
+                      android:layout_height="200dp"
+                      android:layout_marginTop="8dp"
+                      android:background="#16213e" />
+              </LinearLayout>
+          </LinearLayout>
+          EOF
+
+      - name: Generate dummy keystore
+        run: |
+          keytool -genkey -v \
+            -keystore app/dummy.keystore \
+            -alias dummy \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass password \
+            -keypass password \
+            -dname "CN=Dummy, OU=J2ME, O=Emulator, L=Test, S=Test, C=US"
+
+      - name: Generate launcher icons
+        run: |
+          pip install Pillow --quiet
+          python3 << 'PYEOF'
+          from PIL import Image, ImageDraw
+          import os
+
+          def make_icon(size):
+              img = Image.new('RGBA', (size, size), (10, 10, 26, 255))
+              d = ImageDraw.Draw(img)
+              # Draw game console icon
+              margin = size // 8
+              d.rounded_rectangle([margin, margin*2, size-margin, size-margin*2], 
+                                radius=size//10, outline=(233, 69, 96, 255), width=max(2, size//30))
+              # Screen
+              screen_margin = margin*2
+              d.rectangle([screen_margin, margin*3, size-screen_margin, size-margin*4],
+                         fill=(26, 26, 46, 255))
+              return img
+
+          for density, s in {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96,
+                              'xxhdpi': 144, 'xxxhdpi': 192}.items():
+              path = f'app/src/main/res/mipmap-{density}'
+              os.makedirs(path, exist_ok=True)
+              icon = make_icon(s)
+              icon.save(f'{path}/ic_launcher.png')
+              icon.save(f'{path}/ic_launcher_round.png')
+          print("Icons done.")
+          PYEOF
+
+      - name: Create Gradle Wrapper
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y gradle
+          gradle wrapper --gradle-version=8.11.1 --distribution-type=bin
+          chmod +x gradlew
+
+      - name: Set Android SDK path
+        run: echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
+
+      - name: Build signed release APK
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Verify APK signing
+        run: |
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
+          if [ -f "$APK_PATH" ]; then
+              echo "✅ Release APK generated"
+              echo "📦 APK size: $(ls -lh "$APK_PATH" | awk '{print $5}')"
+              $ANDROID_HOME/build-tools/36.0.0/apksigner verify --print-certs "$APK_PATH"
+          else
+              echo "❌ Release APK not found"
+              exit 1
+          fi
+
+      - name: Bundle release
+        run: |
+          mkdir -p J2ME-Emulator-release/.github/workflows
+          cp app/build/outputs/apk/release/app-release.apk J2ME-Emulator-release/J2ME-Emulator.apk
+          cp EmulatorApp.kt J2ME-Emulator-release/
+          cp .github/workflows/build.yml J2ME-Emulator-release/.github/workflows/
+          
+          APK_SIZE=$(ls -lh app/build/outputs/apk/release/app-release.apk | awk '{print $5}')
+          
+          cat > J2ME-Emulator-release/BUILD_INFO.txt << EOF
+          Build:      #${{ github.run_number }}
+          Commit:     ${{ github.sha }}
+          Timestamp:  $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Signed:     Yes (dummy keys)
+          APK Size:   $APK_SIZE
+          Features:   J2ME Emulation + Game Memory Hacking
+          Optimized:  Yes (R8 + resource shrinking)
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: J2ME-Emulator-${{ github.run_number }}
+          path: J2ME-Emulator-release/
+          retention-days: 30          
               ssize_t bytes = process_vm_writev(getpid(), &local_iov, 1, &remote_iov, 1, 0);
               
               return (bytes == size) ? JNI_TRUE : JNI_FALSE;
