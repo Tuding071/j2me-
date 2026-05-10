@@ -1,0 +1,455 @@
+name: Build J2ME Emulator with Game Hacker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Generate project structure
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          PKG=app/src/main/java/com/j2me/emulator
+          mkdir -p $PKG/emulator
+          mkdir -p $PKG/hacker
+          mkdir -p $PKG/ui
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/drawable
+          mkdir -p gradle/wrapper
+
+          cp EmulatorApp.kt $PKG/
+
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "J2ME-Emulator"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.9.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.2.0" apply false
+          }
+          EOF
+
+          cat > app/build.gradle.kts << EOF
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace  = "com.j2me.emulator"
+              compileSdk = 36
+
+              defaultConfig {
+                  applicationId = "com.j2me.emulator"
+                  minSdk        = 26
+                  targetSdk     = 36
+                  versionCode   = ${BUILD_NUMBER}
+                  versionName   = "1.0.${BUILD_NUMBER}"
+                  
+                  ndk {
+                      abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+                  }
+              }
+
+              signingConfigs {
+                  create("release") {
+                      storeFile     = file("dummy.keystore")
+                      storePassword = "password"
+                      keyAlias      = "dummy"
+                      keyPassword   = "password"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      signingConfig  = signingConfigs.getByName("release")
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              
+              externalNativeBuild {
+                  cmake {
+                      path = file("src/main/cpp/CMakeLists.txt")
+                      version = "3.22.1"
+                  }
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.android.material:material:1.12.0")
+              implementation("androidx.constraintlayout:constraintlayout:2.2.0")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.0")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.9.0")
+              
+              // Coroutines
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              
+              // UI
+              implementation("com.google.android.flexbox:flexbox:3.0.0")
+              
+              // File picker
+              implementation("androidx.documentfile:documentfile:1.0.1")
+          }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          android.useAndroidX=true
+          android.enableJetifier=true
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m
+          kotlin.code.style=official
+          android.suppressUnsupportedCompileSdk=36
+          EOF
+
+          cat > app/proguard-rules.pro << 'EOF'
+          # Keep J2ME emulator core
+          -keep class com.j2me.emulator.** { *; }
+          -keep class javax.microedition.** { *; }
+          
+          # Keep native methods
+          -keepclasseswithmembernames class * {
+              native <methods>;
+          }
+          
+          # Keep memory hacking
+          -keep class com.j2me.emulator.hacker.** { *; }
+          
+          # General Android
+          -keep class android.** { *; }
+          -keep class androidx.** { *; }
+          EOF
+
+          # Create native C++ files for memory manipulation
+          mkdir -p app/src/main/cpp
+          
+          cat > app/src/main/cpp/CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project("j2me_hacker")
+
+          add_library(j2me_hacker SHARED
+              memory_scanner.cpp
+              memory_editor.cpp
+              jni_bridge.cpp
+          )
+
+          find_library(log-lib log)
+
+          target_link_libraries(j2me_hacker ${log-lib})
+          EOF
+
+          cat > app/src/main/cpp/memory_scanner.cpp << 'CPPEOF'
+          #include <jni.h>
+          #include <sys/uio.h>
+          #include <unistd.h>
+          #include <vector>
+          #include <string>
+          #include <algorithm>
+          #include <android/log.h>
+
+          #define TAG "MemoryScanner"
+          #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+
+          struct MemoryRegion {
+              uintptr_t start;
+              uintptr_t end;
+              char permissions[8];
+          };
+
+          extern "C" JNIEXPORT jobjectArray JNICALL
+          Java_com_j2me_emulator_hacker_MemoryScanner_nativeScanRegions(
+              JNIEnv* env, jobject /* this */) {
+              
+              std::vector<MemoryRegion> regions;
+              FILE* maps = fopen("/proc/self/maps", "r");
+              if (!maps) return nullptr;
+              
+              char line[512];
+              while (fgets(line, sizeof(line), maps)) {
+                  MemoryRegion region;
+                  sscanf(line, "%lx-%lx %s", &region.start, &region.end, region.permissions);
+                  if (strstr(region.permissions, "rw")) {
+                      regions.push_back(region);
+                  }
+              }
+              fclose(maps);
+              
+              // Return regions to Java
+              jclass regionClass = env->FindClass("com/j2me/emulator/hacker/MemoryRegion");
+              jobjectArray result = env->NewObjectArray(regions.size(), regionClass, nullptr);
+              
+              for (size_t i = 0; i < regions.size(); i++) {
+                  jobject obj = env->NewObject(regionClass, 
+                      env->GetMethodID(regionClass, "<init>", "(JJLjava/lang/String;)V"),
+                      (jlong)regions[i].start, (jlong)regions[i].end,
+                      env->NewStringUTF(regions[i].permissions));
+                  env->SetObjectArrayElement(result, i, obj);
+              }
+              
+              return result;
+          }
+
+          extern "C" JNIEXPORT jlongArray JNICALL
+          Java_com_j2me_emulator_hacker_MemoryScanner_nativeFindValue(
+              JNIEnv* env, jobject /* this */, jlong value, jint typeSize) {
+              
+              std::vector<uint64_t> addresses;
+              char maps_line[512];
+              FILE* maps = fopen("/proc/self/maps", "r");
+              
+              while (fgets(maps_line, sizeof(maps_line), maps)) {
+                  uintptr_t start, end;
+                  char perms[8];
+                  sscanf(maps_line, "%lx-%lx %s", &start, &end, perms);
+                  
+                  if (strstr(perms, "rw")) {
+                      std::vector<uint64_t> matches = scanMemoryRange(start, end, value, typeSize);
+                      addresses.insert(addresses.end(), matches.begin(), matches.end());
+                  }
+              }
+              fclose(maps);
+              
+              jlongArray result = env->NewLongArray(addresses.size());
+              env->SetLongArrayRegion(result, 0, addresses.size(), (jlong*)addresses.data());
+              return result;
+          }
+
+          std::vector<uint64_t> scanMemoryRange(uintptr_t start, uintptr_t end, uint64_t value, int size) {
+              std::vector<uint64_t> results;
+              uintptr_t current = start;
+              
+              while (current < end - size) {
+                  uint64_t data = 0;
+                  struct iovec local_iov = { (void*)current, (size_t)size };
+                  struct iovec remote_iov = { &data, (size_t)size };
+                  ssize_t bytes = process_vm_readv(getpid(), &local_iov, 1, &remote_iov, 1, 0);
+                  
+                  if (bytes == size && data == value) {
+                      results.push_back(current);
+                  }
+                  current += size;
+              }
+              return results;
+          }
+          CPPEOF
+
+          cat > app/src/main/cpp/memory_editor.cpp << 'CPPEOF'
+          #include <jni.h>
+          #include <sys/uio.h>
+          #include <android/log.h>
+
+          #define TAG "MemoryEditor"
+          #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+
+          extern "C" JNIEXPORT jboolean JNICALL
+          Java_com_j2me_emulator_hacker_MemoryEditor_nativeWriteMemory(
+              JNIEnv* env, jobject /* this */, jlong address, jlong value, jint size) {
+              
+              struct iovec local_iov = { &value, (size_t)size };
+              struct iovec remote_iov = { (void*)address, (size_t)size };
+              
+              ssize_t bytes = process_vm_writev(getpid(), &local_iov, 1, &remote_iov, 1, 0);
+              
+              return (bytes == size) ? JNI_TRUE : JNI_FALSE;
+          }
+
+          extern "C" JNIEXPORT jlong JNICALL
+          Java_com_j2me_emulator_hacker_MemoryEditor_nativeReadMemory(
+              JNIEnv* env, jobject /* this */, jlong address, jint size) {
+              
+              jlong value = 0;
+              struct iovec local_iov = { &value, (size_t)size };
+              struct iovec remote_iov = { (void*)address, (size_t)size };
+              
+              process_vm_readv(getpid(), &local_iov, 1, &remote_iov, 1, 0);
+              return value;
+          }
+          CPPEOF
+
+          cat > app/src/main/cpp/jni_bridge.cpp << 'CPPEOF'
+          #include <jni.h>
+
+          JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+              return JNI_VERSION_1_6;
+          }
+          CPPEOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+              
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:theme="@style/AppTheme"
+                  android:hardwareAccelerated="true"
+                  android:largeHeap="true"
+                  android:usesCleartextTraffic="true">
+                  
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <resources>
+              <string name="app_name">J2ME Game Hacker</string>
+              <string name="load_game">Load Game</string>
+              <string name="start_game">Start</string>
+              <string name="pause_game">Pause</string>
+              <string name="open_hacker">Game Hacker</string>
+              <string name="search_value">Search Value</string>
+              <string name="edit_value">Edit Value</string>
+              <string name="memory_regions">Memory Regions</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/themes.xml << 'EOF'
+          <resources>
+              <style name="AppTheme" parent="Theme.MaterialComponents.Dark.NoActionBar">
+                  <item name="colorPrimary">#1a1a2e</item>
+                  <item name="colorPrimaryVariant">#16213e</item>
+                  <item name="colorOnPrimary">#ffffff</item>
+                  <item name="colorSecondary">#e94560</item>
+                  <item name="colorSecondaryVariant">#c23152</item>
+                  <item name="android:windowBackground">#0a0a1a</item>
+                  <item name="android:statusBarColor">#0a0a1a</item>
+                  <item name="android:navigationBarColor">#0a0a1a</item>
+              </style>
+          </resources>
+          EOF
+
+      - name: Generate dummy keystore
+        run: |
+          keytool -genkey -v \
+            -keystore app/dummy.keystore \
+            -alias dummy \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass password \
+            -keypass password \
+            -dname "CN=Dummy, OU=J2ME, O=Emulator, L=Test, S=Test, C=US"
+
+      - name: Generate launcher icons
+        run: |
+          pip install Pillow --quiet
+          python3 << 'PYEOF'
+          from PIL import Image, ImageDraw, ImageFont
+          import os
+
+          def make_icon(size):
+              img = Image.new('RGBA', (size, size), (10, 10, 26, 255))
+              d = ImageDraw.Draw(img)
+              # Draw game console icon
+              margin = size // 8
+              d.rounded_rectangle([margin, margin*2, size-margin, size-margin*2], 
+                                radius=size//10, outline=(233, 69, 96, 255), width=max(2, size//30))
+              # Screen
+              screen_margin = margin*2
+              d.rectangle([screen_margin, margin*3, size-screen_margin, size-margin*4],
+                         fill=(26, 26, 46, 255))
+              return img
+
+          for density, s in {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96,
+                              'xxhdpi': 144, 'xxxhdpi': 192}.items():
+              path = f'app/src/main/res/mipmap-{density}'
+              os.makedirs(path, exist_ok=True)
+              icon = make_icon(s)
+              icon.save(f'{path}/ic_launcher.png')
+              icon.save(f'{path}/ic_launcher_round.png')
+          print("Icons generated successfully")
+          PYEOF
+
+      - name: Create Gradle Wrapper
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y gradle
+          gradle wrapper --gradle-version=8.11.1 --distribution-type=bin
+          chmod +x gradlew
+
+      - name: Set Android SDK path
+        run: echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
+
+      - name: Build signed release APK
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Verify APK signing
+        run: |
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
+          if [ -f "$APK_PATH" ]; then
+              echo "✅ Release APK generated successfully"
+              echo "📦 APK size: $(ls -lh "$APK_PATH" | awk '{print $5}')"
+              $ANDROID_HOME/build-tools/36.0.0/apksigner verify --print-certs "$APK_PATH"
+          else
+              echo "❌ Release APK not found"
+              exit 1
+          fi
+
+      - name: Bundle release
+        run: |
+          mkdir -p J2ME-Emulator-release/.github/workflows
+          cp app/build/outputs/apk/release/app-release.apk J2ME-Emulator-release/J2ME-Emulator.apk
+          cp EmulatorApp.kt J2ME-Emulator-release/
+          cp .github/workflows/build.yml J2ME-Emulator-release/.github/workflows/
+          
+          APK_SIZE=$(ls -lh app/build/outputs/apk/release/app-release.apk | awk '{print $5}')
+          
+          cat > J2ME-Emulator-release/BUILD_INFO.txt << EOF
+          Build:      #${{ github.run_number }}
+          Commit:     ${{ github.sha }}
+          Timestamp:  $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Signed:     Yes (dummy keys)
+          APK Size:   $APK_SIZE
+          Features:   J2ME Emulation + Game Memory Hacking
+          Optimized:  Yes (R8 + resource shrinking)
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: J2ME-Emulator-${{ github.run_number }}
+          path: J2ME-Emulator-release/
+          retention-days: 30
